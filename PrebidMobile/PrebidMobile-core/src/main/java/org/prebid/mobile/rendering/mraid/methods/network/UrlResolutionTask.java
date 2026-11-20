@@ -34,14 +34,50 @@ import java.net.URL;
 import java.net.UnknownHostException;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * Follows a click URL's redirect chain so the browser is handed the landing page.
+ * <p>
+ * The chain shares one budget, {@link #CLICK_RESOLUTION_BUDGET_MILLIS}, independent of
+ * {@link PrebidMobile#setTimeoutMillis(int)}: that setting is the bid-request timeout,
+ * which publishers lower to cut auction latency, and a click should not get less time
+ * because of it. The budget is approximate rather than a hard limit. DNS lookup is not
+ * bounded by the connect timeout, and the read timeout applies per read, so a slow
+ * resolver or a server trickling headers can overrun it.
+ * <p>
+ * When a hop stalls, the URL of that hop is handed to the browser. Its request was
+ * already sent, so the browser requests it a second time and the host can see two
+ * requests for one tap. That is accepted: the alternative is dropping the click, and
+ * the budget makes a stall rare.
+ */
 @VisibleForTesting
 public class UrlResolutionTask extends AsyncTask<String, Void, String> {
     private static final String TAG = UrlResolutionTask.class.getSimpleName();
 
+    /** Time allowed for the whole redirect chain. */
+    static final long CLICK_RESOLUTION_BUDGET_MILLIS = 5_000;
+
+    /** Upper bounds for a single hop, further limited by what is left of the budget. */
+    private static final int HOP_CONNECT_TIMEOUT_MILLIS = BaseNetworkTask.TIMEOUT_DEFAULT;
+    private static final int HOP_READ_TIMEOUT_MILLIS = BaseNetworkTask.SOCKET_TIMEOUT;
+
+    /** Monotonic time source, replaceable in tests. */
+    interface Clock {
+        long nanoTime();
+    }
+
     @NonNull private final UrlResolutionListener listener;
+    private final long budgetMillis;
+    @NonNull private final Clock clock;
 
     public UrlResolutionTask(@NonNull UrlResolutionListener listener) {
+        this(listener, CLICK_RESOLUTION_BUDGET_MILLIS, System::nanoTime);
+    }
+
+    @VisibleForTesting
+    UrlResolutionTask(@NonNull UrlResolutionListener listener, long budgetMillis, @NonNull Clock clock) {
         this.listener = listener;
+        this.budgetMillis = Math.max(1L, budgetMillis);
+        this.clock = clock;
     }
 
     @Nullable
@@ -51,83 +87,56 @@ public class UrlResolutionTask extends AsyncTask<String, Void, String> {
             return null;
         }
 
-        // Read the timeout configuration once. PrebidMobile's statics are settable from
-        // any thread and this runs on THREAD_POOL_EXECUTOR, so re-reading them per hop
-        // against a deadline frozen here would let the two disagree mid-chain. Clamping
-        // at zero also keeps a negative value away from setConnectTimeout, which would
-        // throw.
-        final int configuredConnectMillis = Math.max(0, PrebidMobile.getTimeoutMillis());
-        final int configuredReadMillis = Math.max(0, BaseNetworkTask.readTimeoutMillis());
-        // Summed as a long: both are ints, and their sum overflows for a very large
-        // configured timeout, which would put the deadline in the past and stop the
-        // chain being resolved at all.
-        final long budgetMillis = Math.max(1L, (long) configuredConnectMillis + configuredReadMillis);
-
+        final long deadlineNanos = clock.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis);
         String previousUrl = null;
-        // One budget for the whole chain rather than per hop, so a slow host cannot
-        // multiply the delay by MAX_REDIRECTS before the browser is handed anything.
-        final long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis);
+        // Hops that answered. Once the first one has, the ad server has counted the click.
+        int answeredHops = 0;
         try {
             String locationUrl = urls[0];
 
-            int redirectCount = 0;
-            while (locationUrl != null && redirectCount < GetOriginalUrlTask.MAX_REDIRECTS) {
+            while (locationUrl != null && answeredHops < GetOriginalUrlTask.MAX_REDIRECTS) {
                 // if location url is not http(s), assume it's an Android deep link
                 // this scheme will fail URL validation so we have to check early
                 if (!locationUrl.startsWith(PrebidMobile.SCHEME_HTTP)) {
                     return locationUrl;
                 }
 
-                long remainingMillis = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+                long remainingMillis = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - clock.nanoTime());
                 if (remainingMillis <= 0) {
                     LogUtil.debug(TAG, "Url resolution budget spent; opening " + locationUrl);
-                    return locationUrl;
+                    return isValidUrl(locationUrl) ? locationUrl : null;
                 }
 
                 previousUrl = locationUrl;
-                locationUrl = getRedirectLocation(
-                        locationUrl, remainingMillis, configuredConnectMillis, configuredReadMillis);
-                redirectCount++;
+                locationUrl = getRedirectLocation(locationUrl, remainingMillis);
+                answeredHops++;
             }
         }
         catch (MalformedURLException e) {
-            // A target java.net.URI accepts but java.net.URL cannot parse -- a
-            // non-numeric port, say. URI treats that authority as registry-based and
-            // resolves it happily, so the failure only surfaces on the next hop, and
-            // as an IOException rather than a URISyntaxException. It is a malformed
-            // target either way and must not reach an Intent.
+            // A target URI accepts but URL rejects, such as a non-numeric port.
             LogUtil.error(TAG, "Malformed redirect target: " + previousUrl);
             return null;
         }
         catch (UnknownHostException | ConnectException e) {
-            // DNS did not resolve, or the connection was refused. Neither depends on
-            // which HTTP stack asks, so the browser would fail here too; cancelling
-            // avoids recording a click that cannot land. This applies at any point in
-            // the chain: a hop confirmed unreachable is not worth handing over, even
-            // when an earlier hop succeeded.
-            //
-            // Deliberately not SSLHandshakeException. This probes with
-            // HttpURLConnection, which does not chase Authority Information Access for
-            // a server missing an intermediate certificate, while Chrome and WebView
-            // do -- so a handshake failure here does not predict one in the browser,
-            // and cancelling on it would drop clicks to pages a device renders fine.
+            if (e instanceof ConnectException && !isConnectionRefused(e)) {
+                // ENETUNREACH and similar: transient network state, let the browser retry.
+                LogUtil.debug(TAG, "Network unavailable at " + previousUrl + ": " + e.getMessage());
+                return previousUrl;
+            }
+            if (answeredHops > 0) {
+                // The click was already counted upstream; give the user the browser's answer.
+                LogUtil.debug(TAG, "Unreachable after a counted click: " + previousUrl);
+                return previousUrl;
+            }
             LogUtil.debug(TAG, "Destination unreachable at " + previousUrl + ": " + e.getMessage());
             return null;
         }
         catch (IOException e) {
-            // Everything else: a stalled host, an abrupt disconnect, a TLS failure this
-            // stack is stricter about than a browser. The JDK does not classify these
-            // consistently -- whether a reset surfaces as SocketException or as
-            // SocketTimeoutException depends on OS-level timing of the RST against the
-            // read -- so reachability must not be inferred from the exception type. The
-            // URL in hand is one we had already decided to follow, so hand it to the
-            // browser and let it finish the chain.
+            // Stall, reset or a TLS failure stricter than a browser's; hand over this hop.
             LogUtil.debug(TAG, "Url resolution stopped at " + previousUrl + ": " + e.getMessage());
             return previousUrl;
         }
         catch (URISyntaxException | NullPointerException e) {
-            // A malformed redirect target stays cancelled rather than opening an
-            // intermediary URL, as resolveRedirectLocation intends.
             return null;
         }
 
@@ -135,35 +144,52 @@ public class UrlResolutionTask extends AsyncTask<String, Void, String> {
     }
 
     /**
-     * A timeout bounded by what is left of the chain budget. A configured value of
-     * zero means "unset" here rather than URLConnection's "wait forever", which is the
-     * hang this class exists to prevent.
+     * Whether a connect failure is a definite refusal (ECONNREFUSED) rather than a
+     * network that is momentarily unavailable. Android reports both as
+     * {@link ConnectException}, distinguishable only by the errno in the message.
      */
-    private static int boundedTimeout(final int configuredMillis, final long capMillis) {
-        final long cap = Math.min(Integer.MAX_VALUE, Math.max(1L, capMillis));
-        return (int) (configuredMillis > 0 ? Math.min(configuredMillis, cap) : cap);
+    @VisibleForTesting
+    static boolean isConnectionRefused(@NonNull Throwable error) {
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            String message = cause.getMessage();
+            if (message != null && (message.contains("ECONNREFUSED") || message.contains("Connection refused"))) {
+                return true;
+            }
+            if (cause.getCause() == cause) {
+                break;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isValidUrl(@NonNull String url) {
+        try {
+            new URL(url);
+            return true;
+        }
+        catch (MalformedURLException e) {
+            return false;
+        }
+    }
+
+    /** A per-hop timeout no larger than its cap or what is left of the budget. */
+    private static int boundedTimeout(final int hopCapMillis, final long remainingMillis) {
+        return (int) Math.max(1L, Math.min(hopCapMillis, remainingMillis));
     }
 
     @Nullable
-    private String getRedirectLocation(
-            @NonNull final String urlString,
-            final long remainingMillis,
-            final int configuredConnectMillis,
-            final int configuredReadMillis
-    ) throws IOException, URISyntaxException {
+    private String getRedirectLocation(@NonNull final String urlString, final long remainingMillis)
+    throws IOException, URISyntaxException {
         final URL url = new URL(urlString);
 
-        // Split what is left of the chain budget across this hop's two blocking phases.
-        // Capping each at the full remainder independently would let one hop run for
-        // roughly twice it, which is what the whole-chain bound is meant to stop.
-        final int connectMillis = boundedTimeout(configuredConnectMillis, remainingMillis / 2);
-        final int readMillis = boundedTimeout(configuredReadMillis, remainingMillis - connectMillis);
+        // Split the remainder across connect and read, so one hop cannot use twice it.
+        final int connectMillis = boundedTimeout(HOP_CONNECT_TIMEOUT_MILLIS, remainingMillis / 2);
+        final int readMillis = boundedTimeout(HOP_READ_TIMEOUT_MILLIS, remainingMillis - connectMillis);
 
         HttpURLConnection httpUrlConnection = null;
         try {
             httpUrlConnection = (HttpURLConnection) url.openConnection();
             httpUrlConnection.setInstanceFollowRedirects(false);
-            // HttpURLConnection defaults to no timeout at all.
             httpUrlConnection.setConnectTimeout(connectMillis);
             httpUrlConnection.setReadTimeout(readMillis);
 
@@ -171,10 +197,7 @@ public class UrlResolutionTask extends AsyncTask<String, Void, String> {
         }
         finally {
             if (httpUrlConnection != null) {
-                // Only the status line and the Location header are read and the
-                // connection is discarded immediately, so there is no body worth
-                // draining for reuse -- and draining it would block for a further read
-                // timeout after a hop that has already stalled.
+                // Only the headers are read; draining a body would cost another read timeout.
                 httpUrlConnection.disconnect();
             }
         }
